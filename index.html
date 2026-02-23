@@ -1,1 +1,98 @@
+import pandas as pd
+import geopandas as gpd
+import folium
+from folium import plugins
+import branca.colormap as cm
+import json
 
+# 1. Load Data
+base_path = "Week 5 AI CLI Exercise"
+data_path = f"{base_path}/Parquet_Output"
+
+print("Loading data...")
+facilities = pd.read_parquet(f"{data_path}/AL_STROKE_CENTERS.parquet")
+hosp_matrix = pd.read_parquet(f"{data_path}/GEOID_Hosp_Matrix.parquet")
+geoid_desc = pd.read_parquet(f"{data_path}/GEOID_Desc.parquet")
+mortality = pd.read_parquet(f"{data_path}/Stroke_Deaths_AL.parquet")
+
+# 2. Process Access Data
+print("Calculating access...")
+thrombectomy_ids = facilities[facilities['Stroke_Center_Level'].isin(['Level I', 'Level IIa'])]['Hosp_ID']
+access_matrix = hosp_matrix[hosp_matrix['Hosp_ID'].isin(thrombectomy_ids)]
+bg_access = access_matrix.groupby('GEOID')['Total_TravelTime'].min().reset_index()
+
+# Merge descriptors
+al_bg_desc = geoid_desc[geoid_desc['StateName20'] == 'Alabama'].copy()
+al_bg_desc = al_bg_desc.merge(mortality, left_on='CountyFIPS23', right_on='County Code', how='left')
+final_bg_data = al_bg_desc.merge(bg_access, on='GEOID', how='inner')
+final_bg_data['County_Name'] = final_bg_data['County'].str.replace(', AL', '')
+
+# 3. Load Geometries (using simplified versions for web performance)
+print("Loading geometries...")
+bgs_gdf = gpd.read_file(f"{base_path}/South_BG.zip").to_crs(epsg=4326)
+counties_gdf = gpd.read_file(f"{base_path}/South_Counties.zip").to_crs(epsg=4326)
+
+al_bgs = bgs_gdf[bgs_gdf['GEOID'].isin(final_bg_data['GEOID'])]
+al_counties = counties_gdf[counties_gdf['STATEFP'] == '01']
+
+# Merge data into GeoDataFrame
+gdf_final = al_bgs.merge(final_bg_data[['GEOID', 'Total_TravelTime', 'County_Name', 'Crude Rate', 'Population', 'Deaths']], on='GEOID')
+
+# 4. Create Folium Map
+print("Building Folium map...")
+m = folium.Map(location=[32.8, -86.7], zoom_start=7, tiles='cartodbpositron')
+
+# Create Colormap (Urban Institute Blues)
+colormap = cm.LinearColormap(
+    colors=['#08306b', '#2171b5', '#6baed6', '#deebf7'], # Dark to light
+    index=[0, 30, 60, 120],
+    vmin=0, vmax=120,
+    caption='Travel Time to Thrombectomy (Minutes)'
+)
+colormap.add_to(m)
+
+# 5. Add Heatmap/Waves (Block Groups)
+# We use GeoJson for the waves with style_function for the gradients
+def style_fn(feature):
+    travel_time = feature['properties']['Total_TravelTime']
+    return {
+        'fillColor': colormap(travel_time),
+        'color': 'none', # No internal lines as requested
+        'weight': 0,
+        'fillOpacity': 0.7
+    }
+
+folium.GeoJson(
+    gdf_final,
+    style_function=style_fn,
+    tooltip=folium.GeoJsonTooltip(
+        fields=['County_Name', 'Total_TravelTime', 'Crude Rate', 'Deaths'],
+        aliases=['County:', 'Travel Time (min):', 'Mortality Rate:', 'Total Deaths:'],
+        localize=True
+    )
+).add_to(m)
+
+# 6. Add County Outlines (The "Polished" Borders)
+folium.GeoJson(
+    al_counties,
+    style_function=lambda x: {
+        'fillColor': 'none',
+        'color': '#333333',
+        'weight': 1,
+        'opacity': 0.5
+    },
+    interactive=False
+).add_to(m)
+
+# 7. Add Thrombectomy Centers
+for _, row in facilities[facilities['Stroke_Center_Level'].isin(['Level I', 'Level IIa'])].iterrows():
+    folium.Marker(
+        location=[row['Latitude'], row['Longitude']],
+        icon=folium.Icon(color='blue', icon='plus-square', prefix='fa'),
+        popup=f"<b>{row['Hospital_Name']}</b><br>{row['Stroke_Center_Level']}"
+    ).add_to(m)
+
+# 8. Save
+output_file = "folium_stroke_map.html"
+m.save(output_file)
+print(f"Done! Folium map saved to: {output_file}")
